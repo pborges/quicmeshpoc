@@ -1,0 +1,41 @@
+# ─── Go ──────────────────────────────────────────────────────────────────────
+# Compiled binaries / plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary built with `go test -c`, and coverage/profile output
+*.test
+*.out
+coverage.*
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency directory (uncomment if you ever vendor)
+# vendor/
+
+# ─── This project's runtime artifacts ────────────────────────────────────────
+# Per-process slog files (lighthouse.log, alice.log, …). Created automatically.
+logs/
+
+# Let's Encrypt / ACME certificate cache.
+acme-cache/
+
+# Built command binaries (we run via `go run`; don't commit compiled outputs).
+/lighthouse
+/quicchat
+/cmd/lighthouse/lighthouse
+/cmd/quicchat/quicchat
+
+# ─── Editor / OS cruft ───────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local environment overrides
+.env
