@@ -8,10 +8,10 @@ relays a single byte of chat traffic.
 
 Everything runs on QUIC (UDP). There are two programs:
 
-| program | what it is |
-|---|---|
+| program          | what it is                                                                                                                                        |
+|------------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
 | `cmd/lighthouse` | the rendezvous / signaling server. Speaks a tiny JSON API over **HTTP/3**, plus a live **web dashboard** (htmx + SSE). Never relays chat traffic. |
-| `cmd/quicchat`   | the peer. A **charm/Bubble Tea TUI** chat client. Every peer is identical. |
+| `cmd/quicchat`   | the peer. A **charm/Bubble Tea TUI** chat client. Every peer is identical.                                                                        |
 
 > Read the code top-to-bottom — it's written to be read. Start with
 > `cmd/quicchat/mesh.go` (the hole punch + mesh) and `cmd/lighthouse/main.go`
@@ -50,18 +50,18 @@ The lighthouse does three things, nothing more:
 ### The handoff, step by step
 
 ```
-alice                         lighthouse                         bob
-  | --POST /register--------------> | (sees alice@1.2.3.4:5678, + her LAN addrs)
-  |                                 | <-------------POST /register-- (sees bob@9.8.7.6:4321)
-  | --GET /peers-----------------> | --> [bob @ 9.8.7.6:4321 (+ LAN addrs)]
-  | --POST /connect{from,to}------> | queue punch-back for bob
-  | --dial QUIC to bob------------> X  (bob's NAT drops it: no hole yet)
-  |                                 | <--GET /signals------------- bob polls
-  |                                 | --> "punch toward alice (public + LAN)"
-  |                                 |          bob fires punch packets at alice -->
-  | <==== QUIC handshake completes through both holes ============> |
-  | --POST /handoff--------------> | (dashboard shows "handed off ✔")
-  | <======== direct peer-to-peer chat over a QUIC stream =========> |
+  alice                         lighthouse                 bob
+  | --POST /register------------> |  sees alice@1.2.3.4:5678 (+ LAN)
+  |                               | <--------- POST /register  (sees bob@9.8.7.6:4321)
+  | --GET /peers----------------> |  returns [bob @ 9.8.7.6:4321 (+ LAN)]
+  | --POST /connect{from,to}----> |  queues a punch-back for bob
+  | --dial QUIC to bob----------> X  (bob's NAT drops it — no hole yet)
+  |                               | <--------- GET /signals  (bob polls)
+  |                               | ---------> "punch toward alice (public + LAN)"
+  |                               |   bob fires punch packets at alice -->
+  | <===== QUIC handshake completes through both holes — alice <-> bob =====>
+  | --POST /handoff-------------> |  dashboard shows "handed off ✔"
+  | <===== direct peer-to-peer chat over a QUIC stream — alice <-> bob =====>
 ```
 
 `alice` is the **initiator** (dials). `bob` is the **responder** (fires throwaway
@@ -105,11 +105,11 @@ the same 1:1 peer streams written to in a loop.
 
 ## How fast does a peer notice another is gone?
 
-| how the peer leaves | detected in |
-|---|---|
-| clean quit (`q` / ctrl-c / `kill`) | **< 1s** — it sends a QUIC `CONNECTION_CLOSE` on shutdown |
-| silent death (`kill -9`, Wi-Fi drop, sleep) | **~20s** — QUIC `MaxIdleTimeout` (keepalive every 7s) |
-| drops off the sidebar list | **~30s** — lighthouse `peerTTL`, polled every 3s |
+| how the peer leaves                         | detected in                                               |
+|---------------------------------------------|-----------------------------------------------------------|
+| clean quit (`q` / ctrl-c / `kill`)          | **< 1s** — it sends a QUIC `CONNECTION_CLOSE` on shutdown |
+| silent death (`kill -9`, Wi-Fi drop, sleep) | **~20s** — QUIC `MaxIdleTimeout` (keepalive every 7s)     |
+| drops off the sidebar list                  | **~30s** — lighthouse `peerTTL`, polled every 3s          |
 
 A dropped link is then re-dialed automatically, so transient blips self-recover.
 
@@ -184,10 +184,10 @@ CAP_NET_BIND_SERVICE` so it can bind 80/443 unprivileged, and point
 
 QUIC is always encrypted, so the lighthouse always needs a cert. Pick a mode:
 
-| mode | flags | when |
-|---|---|---|
-| **self-signed** (default) | *(none)* | local / LAN testing. Clients use `-insecure` (default `true`). |
-| **provide your own** | `-cert fullchain.pem -key privkey.pem` | you got a cert elsewhere (certbot DNS-01, internal CA, …). |
+| mode                        | flags                                             | when                                                            |
+|-----------------------------|---------------------------------------------------|-----------------------------------------------------------------|
+| **self-signed** (default)   | *(none)*                                          | local / LAN testing. Clients use `-insecure` (default `true`).  |
+| **provide your own**        | `-cert fullchain.pem -key privkey.pem`            | you got a cert elsewhere (certbot DNS-01, internal CA, …).      |
 | **automatic Let's Encrypt** | `-domain mesh.example.com -email you@example.com` | public deployment. The lighthouse issues & renews its own cert. |
 
 Automatic issuance uses the ACME **HTTP-01** challenge, which needs:
@@ -256,11 +256,11 @@ punching fails. Your realistic options:
 Every process writes its own log file under `./logs/` (created automatically, and
 git-ignored):
 
-| process | file |
-|---|---|
-| `lighthouse` | `logs/lighthouse.log` (also echoed to stderr) |
-| `quicchat alice` | `logs/alice.log` |
-| `quicchat bob` | `logs/bob.log` |
+| process          | file                                          |
+|------------------|-----------------------------------------------|
+| `lighthouse`     | `logs/lighthouse.log` (also echoed to stderr) |
+| `quicchat alice` | `logs/alice.log`                              |
+| `quicchat bob`   | `logs/bob.log`                                |
 
 The clients log to a **file** (not the screen) on purpose: they're full-screen
 TUIs, so stray stdout/stderr would corrupt the display. Tail a node's log in a
@@ -286,25 +286,25 @@ UI or wedge your terminal.
 
 **lighthouse**
 
-| flag | default | meaning |
-|---|---|---|
-| `-addr` | `:4433` | UDP address for the HTTP/3 signaling API |
-| `-web` | `:8080` | TCP address for the plain-HTTP dashboard |
-| `-web-tls` | *(off)* | TCP address for the HTTPS dashboard (reuses the cert) |
-| `-domain` | *(off)* | enable automatic Let's Encrypt for this domain |
-| `-email` | | ACME account contact email |
-| `-acme-cache` | `./acme-cache` | directory to cache issued certs |
-| `-acme-staging` | `false` | use Let's Encrypt staging (no rate limits) |
-| `-http01-addr` | `:80` | TCP address for the ACME HTTP-01 challenge |
-| `-cert` / `-key` | | serve a certificate you supply instead |
+| flag             | default        | meaning                                               |
+|------------------|----------------|-------------------------------------------------------|
+| `-addr`          | `:4433`        | UDP address for the HTTP/3 signaling API              |
+| `-web`           | `:8080`        | TCP address for the plain-HTTP dashboard              |
+| `-web-tls`       | *(off)*        | TCP address for the HTTPS dashboard (reuses the cert) |
+| `-domain`        | *(off)*        | enable automatic Let's Encrypt for this domain        |
+| `-email`         |                | ACME account contact email                            |
+| `-acme-cache`    | `./acme-cache` | directory to cache issued certs                       |
+| `-acme-staging`  | `false`        | use Let's Encrypt staging (no rate limits)            |
+| `-http01-addr`   | `:80`          | TCP address for the ACME HTTP-01 challenge            |
+| `-cert` / `-key` |                | serve a certificate you supply instead                |
 
 **quicchat**
 
-| arg / flag | default | meaning |
-|---|---|---|
-| `<nodeid>` (positional) | *(required)* | your unique peer name |
-| `-lighthouse` | `https://127.0.0.1:4433` | lighthouse base URL |
-| `-insecure` | `true` | skip TLS verification of the lighthouse cert (set `=false` for a real cert) |
+| arg / flag              | default                  | meaning                                                                     |
+|-------------------------|--------------------------|-----------------------------------------------------------------------------|
+| `<nodeid>` (positional) | *(required)*             | your unique peer name                                                       |
+| `-lighthouse`           | `https://127.0.0.1:4433` | lighthouse base URL                                                         |
+| `-insecure`             | `true`                   | skip TLS verification of the lighthouse cert (set `=false` for a real cert) |
 
 ---
 
