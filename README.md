@@ -56,8 +56,8 @@ The lighthouse does three things, nothing more:
   | --GET /peers----------------> |  returns [bob @ 9.8.7.6:4321 (+ LAN)]
   | --POST /connect{from,to}----> |  queues a punch-back for bob
   | --dial QUIC to bob----------> X  (bob's NAT drops it — no hole yet)
-  |                               | <--------- GET /signals  (bob polls)
-  |                               | ---------> "punch toward alice (public + LAN)"
+  |                               |  bob holds an open GET /signals/stream (SSE)
+  |                               | ===push===> "punch toward alice (public + LAN)"
   |                               |   bob fires punch packets at alice -->
   | <===== QUIC handshake completes through both holes — alice <-> bob =====>
   | --POST /handoff-------------> |  dashboard shows "handed off ✔"
@@ -244,8 +244,9 @@ punching fails. Your realistic options:
    source address is *preserved* (it's NAT, not proxying), so everything works.
    This is the easiest way to put it "behind" something.
 3. **Split address-reflection from the API (the "proper" way).** Keep a normal
-   reverse proxy in front of the `/register`, `/peers`, `/connect`, `/signals`
-   API, **and** add a tiny directly-reachable STUN-style reflector that tells
+   reverse proxy in front of the `/register`, `/peers`, `/connect`,
+   `/signals/stream` API, **and** add a tiny directly-reachable STUN-style
+   reflector that tells
    each client its public address. This is exactly how WebRTC/Tailscale separate
    STUN servers from the control plane.
 

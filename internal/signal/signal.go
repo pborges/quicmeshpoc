@@ -7,8 +7,8 @@
 //  1. Observe each client's PUBLIC UDP address (the address its NAT presents to
 //     the internet) and remember it under a node id.  -> Register
 //  2. Hand out the list of everyone it currently knows about.                -> Peers
-//  3. When client A wants to reach client B, leave a note for B telling it to
-//     "punch" a hole back toward A.                                          -> Connect / Signals
+//  3. When client A wants to reach client B, push a note to B (over B's open
+//     SSE stream) telling it to "punch" a hole back toward A.   -> Connect / Signal
 //
 // That is the entire control plane. Everything else (the actual hole punch and
 // the chat) happens directly between the two clients.
@@ -60,17 +60,12 @@ type ConnectRequest struct {
 	To   string `json:"to"`
 }
 
-// Signal is a pending "please punch back toward this peer" note that a node
-// picks up when it polls GET /signals. FromAddr is the public address the
-// responder should fire punch packets at.
+// Signal is a "please punch back toward this peer" note. The lighthouse pushes
+// these to a node over its long-lived GET /signals/stream SSE connection, one
+// Signal per "signal" event (JSON-encoded in the event's data). FromAddr is the
+// public address the responder should fire punch packets at.
 type Signal struct {
 	FromNodeID     string   `json:"from_node_id"`
 	FromAddr       string   `json:"from_addr"`
 	FromLocalAddrs []string `json:"from_local_addrs,omitempty"` // LAN candidates to also punch toward
-}
-
-// SignalsResponse is the answer to GET /signals: every punch request queued for
-// the polling node since it last asked.
-type SignalsResponse struct {
-	Signals []Signal `json:"signals"`
 }

@@ -63,6 +63,12 @@ type lighthouse struct {
 	nodes   map[string]registration    // nodeID -> registration
 	signals map[string][]signal.Signal // nodeID -> queued punch requests for it
 
+	// signalSubs holds the live SSE signal stream for each node: a "wake up and
+	// drain your queue" nudge channel keyed by nodeID. /connect pings the channel
+	// so the responder's stream pushes the punch request immediately instead of
+	// waiting out a poll. At most one stream per node (see "one process per name").
+	signalSubs map[string]chan struct{}
+
 	// Dashboard state (see dashboard.go):
 	handoffs []*handoff               // recent handoff attempts, newest last
 	events   []logEntry               // recent human-readable log, newest last
@@ -71,9 +77,10 @@ type lighthouse struct {
 
 func newLighthouse() *lighthouse {
 	return &lighthouse{
-		nodes:   make(map[string]registration),
-		signals: make(map[string][]signal.Signal),
-		subs:    make(map[chan string]struct{}),
+		nodes:      make(map[string]registration),
+		signals:    make(map[string][]signal.Signal),
+		signalSubs: make(map[string]chan struct{}),
+		subs:       make(map[chan string]struct{}),
 	}
 }
 
@@ -180,29 +187,40 @@ func (l *lighthouse) handleConnect(w http.ResponseWriter, r *http.Request) {
 		h.completed = false
 		h.completedAt = time.Time{}
 	}
+	sub := l.signalSubs[req.To] // wake the responder's SSE stream (if connected)
 	l.mu.Unlock()
 
 	if !ok {
 		http.Error(w, "unknown 'from' node", http.StatusBadRequest)
 		return
 	}
+
+	// Nudge the responder's stream to drain its queue now. Non-blocking: the
+	// channel is buffered (depth 1) and the stream drains the WHOLE queue per
+	// wake, so a single coalesced nudge is enough. If the responder isn't
+	// streaming yet, the signal waits in the queue and its stream drains it on
+	// connect.
+	if sub != nil {
+		select {
+		case sub <- struct{}{}:
+		default:
+		}
+	}
 	l.addEvent("handoff-requested", fmt.Sprintf("%s wants to reach %s — waiting for handoff", req.From, req.To))
 	slog.Info("connect requested", "from", req.From, "to", req.To)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleSignals drains and returns the punch requests queued for the polling
-// node. Draining (delete after read) keeps it simple: each signal is delivered
-// once.
-func (l *lighthouse) handleSignals(w http.ResponseWriter, r *http.Request) {
-	self := r.URL.Query().Get("self")
-
+// drainSignals removes and returns every punch request queued for self.
+// Draining (delete after read) keeps delivery exactly-once. It also marks the
+// matching dashboard handoffs as "picked up" (the responder has now learned it
+// should punch back) and returns the from-ids that newly transitioned, so the
+// caller can emit "punching…" log events after releasing the lock.
+func (l *lighthouse) drainSignals(self string) (pending []signal.Signal, pickedUp []string) {
 	l.mu.Lock()
-	pending := l.signals[self]
+	defer l.mu.Unlock()
+	pending = l.signals[self]
 	delete(l.signals, self)
-	// Mark any matching pending handoffs as "picked up": the responder has now
-	// learned it should punch back, so the punch is in progress.
-	var pickedUp []string
 	for _, s := range pending {
 		for _, h := range l.handoffs {
 			if h.from == s.FromNodeID && h.to == self && !h.pickedUp && !h.completed {
@@ -211,12 +229,93 @@ func (l *lighthouse) handleSignals(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	l.mu.Unlock()
+	return pending, pickedUp
+}
 
+// subscribeSignals registers (and returns) the nudge channel for self's SSE
+// signal stream, replacing any previous one (e.g. a reconnect). The channel is
+// buffered depth-1 so /connect's non-blocking nudge never has to wait.
+func (l *lighthouse) subscribeSignals(self string) chan struct{} {
+	ch := make(chan struct{}, 1)
+	l.mu.Lock()
+	l.signalSubs[self] = ch
+	l.mu.Unlock()
+	return ch
+}
+
+// unsubscribeSignals removes self's nudge channel, but only if it's still the
+// one we registered — so a stale stream tearing down doesn't evict a newer
+// stream that already replaced it.
+func (l *lighthouse) unsubscribeSignals(self string, ch chan struct{}) {
+	l.mu.Lock()
+	if l.signalSubs[self] == ch {
+		delete(l.signalSubs, self)
+	}
+	l.mu.Unlock()
+}
+
+// handleSignalsStream is the responder's side of the punch handshake, delivered
+// as Server-Sent Events. The node opens this once and leaves it open; the
+// lighthouse pushes a "signal" event (a JSON-encoded signal.Signal) the moment
+// /connect queues a punch request for it. This replaces the old poll loop, so
+// the responder reacts in milliseconds instead of waiting out a poll interval —
+// which also tightens the simultaneity that makes the punch land.
+func (l *lighthouse) handleSignalsStream(w http.ResponseWriter, r *http.Request) {
+	self := r.URL.Query().Get("self")
+	if self == "" {
+		http.Error(w, "missing ?self=", http.StatusBadRequest)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	ch := l.subscribeSignals(self)
+	defer l.unsubscribeSignals(self, ch)
+
+	slog.Info("signals stream opened", "node", self)
+
+	// Flush anything queued before we subscribed (a /connect that raced ahead of
+	// this stream connecting).
+	l.flushSignals(self, w, flusher)
+
+	// A heartbeat keeps idle intermediaries from closing the connection.
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return // node disconnected / shutting down
+		case <-ch:
+			l.flushSignals(self, w, flusher)
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": keep-alive\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// flushSignals drains self's queued punch requests and writes each as a
+// "signal" SSE event, then emits the "punching…" dashboard log for any that
+// newly transitioned to picked-up.
+func (l *lighthouse) flushSignals(self string, w http.ResponseWriter, flusher http.Flusher) {
+	pending, pickedUp := l.drainSignals(self)
+	for _, s := range pending {
+		buf, _ := json.Marshal(s)
+		writeSSE(w, "signal", string(buf))
+	}
+	if len(pending) > 0 {
+		flusher.Flush()
+	}
 	for _, from := range pickedUp {
 		l.addEvent("punching", fmt.Sprintf("%s picked up punch request from %s — punching…", self, from))
 	}
-	writeJSON(w, signal.SignalsResponse{Signals: pending})
 }
 
 // handleHandoff is reported by the INITIATOR once a peer connection is fully
@@ -357,7 +456,7 @@ func main() {
 	mux.HandleFunc("POST /register", lh.handleRegister)
 	mux.HandleFunc("GET /peers", lh.handlePeers)
 	mux.HandleFunc("POST /connect", lh.handleConnect)
-	mux.HandleFunc("GET /signals", lh.handleSignals)
+	mux.HandleFunc("GET /signals/stream", lh.handleSignalsStream)
 	mux.HandleFunc("POST /handoff", lh.handleHandoff)
 	// Human dashboard (browsers reach these over plain TCP HTTP — see below).
 	mux.HandleFunc("GET /", lh.handleIndex)

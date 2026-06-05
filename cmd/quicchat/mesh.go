@@ -82,12 +82,13 @@ type peerConn struct {
 // Mesh owns the shared socket and all peer connections. Its goroutines push
 // updates to the TUI by calling the events callback (wired to program.Send).
 type Mesh struct {
-	nodeID    string
-	lhURL     string // lighthouse base URL, e.g. https://127.0.0.1:4433
-	transport *quic.Transport
-	listener  *quic.Listener
-	http3     *http.Client // HTTP/3 client that rides the shared transport
-	log       *slog.Logger // writes to logs/<nodeid>.log
+	nodeID      string
+	lhURL       string // lighthouse base URL, e.g. https://127.0.0.1:4433
+	transport   *quic.Transport
+	listener    *quic.Listener
+	http3       *http.Client // HTTP/3 client for short request/response calls (10s timeout)
+	http3Stream *http.Client // same transport, NO timeout — for the long-lived /signals/stream SSE
+	log         *slog.Logger // writes to logs/<nodeid>.log
 
 	// events delivers tea.Msg values to the bubbletea program. Set by main
 	// before Start. We store it as a plain func so this file has no TUI deps.
@@ -147,6 +148,10 @@ func NewMesh(nodeID, lighthouseURL string, insecure bool, logger *slog.Logger) (
 		},
 	}
 	m.http3 = &http.Client{Transport: rt, Timeout: 10 * time.Second}
+	// A second client over the SAME transport with NO timeout: the signals SSE
+	// stream is held open indefinitely, so the 10s timeout above would kill it.
+	// Sharing rt means this rides the same QUIC connection / NAT mapping.
+	m.http3Stream = &http.Client{Transport: rt}
 
 	// 4. Listen on the SAME transport for inbound peer connections. Peers dial
 	//    us with ALPN quickmesh-chat; the lighthouse traffic (ALPN h3) is
@@ -204,10 +209,10 @@ func (m *Mesh) statusf(format string, a ...any) {
 
 // Start launches all the background loops. None of them block.
 func (m *Mesh) Start(ctx context.Context) {
-	go m.registerLoop(ctx) // keep ourselves advertised + refresh NAT mapping
-	go m.peersLoop(ctx)    // refresh the sidebar list
-	go m.signalsLoop(ctx)  // react to "someone wants to punch to you"
-	go m.acceptLoop(ctx)   // accept inbound peer connections
+	go m.registerLoop(ctx)      // keep ourselves advertised + refresh NAT mapping
+	go m.peersLoop(ctx)         // refresh the sidebar list
+	go m.signalsStreamLoop(ctx) // react to "someone wants to punch to you"
+	go m.acceptLoop(ctx)        // accept inbound peer connections
 }
 
 // ─────────────────────────── lighthouse helpers ────────────────────────────
@@ -303,7 +308,7 @@ func (m *Mesh) peersLoop(ctx context.Context) {
 // two redundant connections — only ONE side of each pair initiates: the node
 // with the lexicographically smaller id. The other side simply accepts the
 // inbound connection (its NAT hole is opened by the punch-back it already does
-// in signalsLoop). Connect itself is idempotent, so calling this every poll is
+// in signalsStreamLoop). Connect itself is idempotent, so calling this every poll is
 // cheap and also serves as automatic retry for links that haven't formed yet.
 func (m *Mesh) autoConnect(peers []signal.Peer) {
 	for _, p := range peers {
@@ -314,29 +319,82 @@ func (m *Mesh) autoConnect(peers []signal.Peer) {
 	}
 }
 
-// signalsLoop polls for punch requests aimed at us. When another node asks the
-// lighthouse to reach us, we get a Signal here and play the RESPONDER role:
-// fire punch packets toward them so our NAT opens, then let acceptLoop pick up
-// the QUIC connection they dial.
-func (m *Mesh) signalsLoop(ctx context.Context) {
-	defer logutil.Recover(m.log, "signalsLoop")
-	t := time.NewTicker(1 * time.Second)
-	defer t.Stop()
+// signalsStreamLoop holds open an SSE stream to the lighthouse and reacts to
+// punch requests aimed at us the instant they're pushed. When another node asks
+// the lighthouse to reach us, a Signal arrives here and we play the RESPONDER
+// role: fire punch packets toward them so our NAT opens, then let acceptLoop
+// pick up the QUIC connection they dial.
+//
+// The stream can drop (lighthouse restart, idle timeout, transient loss), so
+// this loops: (re)connect, consume until it ends, brief backoff, repeat — until
+// our context is cancelled on shutdown.
+func (m *Mesh) signalsStreamLoop(ctx context.Context) {
+	defer logutil.Recover(m.log, "signalsStreamLoop")
 	for {
-		var resp signal.SignalsResponse
-		if err := m.get(ctx, "/signals?self="+m.nodeID, &resp); err != nil {
-			m.log.Debug("signals poll failed", "err", err)
-		} else {
-			for _, s := range resp.Signals {
-				m.respondToPunch(s)
-			}
+		if err := m.streamSignals(ctx); err != nil && ctx.Err() == nil {
+			m.log.Debug("signals stream ended; reconnecting", "err", err)
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case <-time.After(2 * time.Second): // backoff before reconnecting
 		}
 	}
+}
+
+// streamSignals opens the /signals/stream SSE endpoint and dispatches each
+// "signal" event to respondToPunch. It returns when the stream ends (error,
+// EOF, or context cancel) so signalsStreamLoop can reconnect.
+func (m *Mesh) streamSignals(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.lhURL+"/signals/stream?self="+m.nodeID, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	// Use the no-timeout client: this response body is read for the lifetime of
+	// the stream, not a single round-trip.
+	resp, err := m.http3Stream.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("/signals/stream: %s", resp.Status)
+	}
+	m.log.Debug("signals stream connected")
+
+	// Minimal SSE parser: accumulate "event:"/"data:" fields until a blank line
+	// dispatches the event. Comment lines (": …", our heartbeat) are ignored.
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	var event, data string
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case line == "": // blank line — dispatch the accumulated event
+			if data != "" && (event == "" || event == "signal") {
+				var s signal.Signal
+				if err := json.Unmarshal([]byte(data), &s); err != nil {
+					m.log.Warn("bad signal event", "data", data, "err", err)
+				} else {
+					m.respondToPunch(s)
+				}
+			}
+			event, data = "", ""
+		case strings.HasPrefix(line, ":"): // comment / heartbeat
+			continue
+		case strings.HasPrefix(line, "event:"):
+			event = strings.TrimSpace(line[len("event:"):])
+		case strings.HasPrefix(line, "data:"):
+			d := strings.TrimPrefix(line[len("data:"):], " ")
+			if data == "" {
+				data = d
+			} else {
+				data += "\n" + d // SSE joins multiple data: lines with newlines
+			}
+		}
+	}
+	return scanner.Err()
 }
 
 // ─────────────────────────── candidate addresses ───────────────────────────
