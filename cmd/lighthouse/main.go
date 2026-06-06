@@ -50,9 +50,10 @@ const peerTTL = 30 * time.Second
 
 // registration is what we remember about one node.
 type registration struct {
-	addr       string    // public UDP ip:port we observed
-	localAddrs []string  // LAN candidates the client reported (we can't observe these)
-	lastSeen   time.Time // updated on every /register
+	addr        string    // public UDP ip:port we observed
+	localAddrs  []string  // LAN candidates the client reported (we can't observe these)
+	incarnation string    // random id fixed for the node's process lifetime; changes on restart
+	lastSeen    time.Time // updated on every /register
 }
 
 // lighthouse is the whole server state: who is registered, what punch requests
@@ -110,15 +111,22 @@ func (l *lighthouse) handleRegister(w http.ResponseWriter, r *http.Request) {
 	addr := observedAddr(r)
 
 	l.mu.Lock()
-	_, existed := l.nodes[req.NodeID]
-	l.nodes[req.NodeID] = registration{addr: addr, localAddrs: req.LocalAddrs, lastSeen: time.Now()}
+	prev, existed := l.nodes[req.NodeID]
+	l.nodes[req.NodeID] = registration{addr: addr, localAddrs: req.LocalAddrs, incarnation: req.Incarnation, lastSeen: time.Now()}
 	l.mu.Unlock()
 
-	// Only log the FIRST time we see a node (registrations repeat every ~10s as
-	// a keepalive; we don't want to flood the dashboard log with those).
-	if !existed {
+	// A changed incarnation under an existing name means the node RESTARTED (new
+	// process, new socket/port) rather than just sending its periodic keepalive.
+	restarted := existed && prev.incarnation != "" && req.Incarnation != "" && prev.incarnation != req.Incarnation
+
+	// Only log the FIRST time we see a node, or when it restarts (registrations
+	// repeat every ~10s as a keepalive; we don't want to flood the log with those).
+	switch {
+	case !existed:
 		l.addEvent("online", fmt.Sprintf("%s came online (public addr %s)", req.NodeID, addr))
-	} else {
+	case restarted:
+		l.addEvent("online", fmt.Sprintf("%s restarted (public addr %s)", req.NodeID, addr))
+	default:
 		l.broadcast() // refresh "last seen" without a new log line
 	}
 
@@ -144,7 +152,7 @@ func (l *lighthouse) handlePeers(w http.ResponseWriter, r *http.Request) {
 		if id == self {
 			continue
 		}
-		resp.Peers = append(resp.Peers, signal.Peer{NodeID: id, Addr: reg.addr, LocalAddrs: reg.localAddrs})
+		resp.Peers = append(resp.Peers, signal.Peer{NodeID: id, Addr: reg.addr, LocalAddrs: reg.localAddrs, Incarnation: reg.incarnation})
 	}
 	l.mu.Unlock()
 

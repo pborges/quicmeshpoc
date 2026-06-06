@@ -29,65 +29,89 @@ import (
 // testLogger discards logs during the test.
 var testLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
-func TestEndToEnd(t *testing.T) {
-	// 1. Build the lighthouse binary to a temp path so we can kill it cleanly.
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "lighthouse")
+// collector captures the tea.Msg values a Mesh pushes, so a test can assert on
+// peer connection states and received chat lines.
+type collector struct {
+	mu       sync.Mutex
+	states   map[string]connState
+	messages []chatMsg
+}
+
+func newCollector() *collector { return &collector{states: map[string]connState{}} }
+
+// wire returns the events callback to hand to Mesh.SetEvents.
+func (c *collector) wire() func(any) {
+	return func(msg any) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		switch m := msg.(type) {
+		case stateMsg:
+			c.states[m.peerID] = m.state
+		case chatMsg:
+			c.messages = append(c.messages, m)
+		}
+	}
+}
+
+func (c *collector) state(peer string) connState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.states[peer]
+}
+
+func (c *collector) hasMessage(peer, text string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, m := range c.messages {
+		if m.peerID == peer && m.text == text {
+			return true
+		}
+	}
+	return false
+}
+
+// startLighthouse builds and starts the lighthouse binary on the given loopback
+// API (UDP) and web (TCP) addresses, returning their base URLs. The process is
+// killed via t.Cleanup when the test ends.
+func startLighthouse(t *testing.T, apiAddr, webAddr string) (lhURL, webURL string) {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "lighthouse")
 	build := exec.Command("go", "build", "-o", bin, "../lighthouse")
 	build.Stderr = os.Stderr
 	if err := build.Run(); err != nil {
 		t.Fatalf("build lighthouse: %v", err)
 	}
-
-	// 2. Start it on a fixed loopback UDP port (API) + TCP port (web dashboard).
-	const lhURL = "https://127.0.0.1:14433"
-	const webURL = "http://127.0.0.1:18080"
-	lh := exec.Command(bin, "-addr", "127.0.0.1:14433", "-web", "127.0.0.1:18080")
+	lh := exec.Command(bin, "-addr", apiAddr, "-web", webAddr)
 	lh.Stderr = os.Stderr
 	if err := lh.Start(); err != nil {
 		t.Fatalf("start lighthouse: %v", err)
 	}
-	defer lh.Process.Kill()
+	t.Cleanup(func() { lh.Process.Kill() })
 	time.Sleep(500 * time.Millisecond) // let it bind the socket
+	return "https://" + apiAddr, "http://" + webAddr
+}
+
+// newMesh builds a Mesh wired to a fresh collector and starts it.
+func newMesh(t *testing.T, ctx context.Context, id, lhURL string) (*Mesh, *collector) {
+	t.Helper()
+	m, err := NewMesh(id, lhURL, true, testLogger)
+	if err != nil {
+		t.Fatalf("%s mesh: %v", id, err)
+	}
+	c := newCollector()
+	m.SetEvents(c.wire())
+	m.Start(ctx)
+	return m, c
+}
+
+func TestEndToEnd(t *testing.T) {
+	lhURL, webURL := startLighthouse(t, "127.0.0.1:14433", "127.0.0.1:18080")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 3. A tiny event collector shared by both meshes.
-	type collector struct {
-		mu       sync.Mutex
-		states   map[string]connState
-		messages []chatMsg
-	}
-	newCollector := func() *collector { return &collector{states: map[string]connState{}} }
-
-	alice, err := NewMesh("alice", lhURL, true, testLogger)
-	if err != nil {
-		t.Fatalf("alice mesh: %v", err)
-	}
-	bob, err := NewMesh("bob", lhURL, true, testLogger)
-	if err != nil {
-		t.Fatalf("bob mesh: %v", err)
-	}
-
-	ac, bc := newCollector(), newCollector()
-	wire := func(c *collector) func(any) {
-		return func(msg any) {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			switch m := msg.(type) {
-			case stateMsg:
-				c.states[m.peerID] = m.state
-			case chatMsg:
-				c.messages = append(c.messages, m)
-			}
-		}
-	}
-	alice.SetEvents(wire(ac))
-	bob.SetEvents(wire(bc))
-
-	alice.Start(ctx)
-	bob.Start(ctx)
+	alice, ac := newMesh(t, ctx, "alice", lhURL)
+	bob, bc := newMesh(t, ctx, "bob", lhURL)
 
 	// 4. Wait until alice can see bob in the peer list (proves register + peers).
 	var bobPeer signal.Peer
@@ -111,11 +135,7 @@ func TestEndToEnd(t *testing.T) {
 	alice.Connect(bobPeer)
 
 	if !waitFor(t, 20*time.Second, func() bool {
-		ac.mu.Lock()
-		bc.mu.Lock()
-		defer ac.mu.Unlock()
-		defer bc.mu.Unlock()
-		return ac.states["bob"] == stateConnected && bc.states["alice"] == stateConnected
+		return ac.state("bob") == stateConnected && bc.state("alice") == stateConnected
 	}) {
 		t.Fatal("alice<->bob never reached connected state")
 	}
@@ -123,14 +143,7 @@ func TestEndToEnd(t *testing.T) {
 	// 6. Alice sends a chat line; bob must receive it.
 	alice.SendChat("bob", "hello bob")
 	if !waitFor(t, 10*time.Second, func() bool {
-		bc.mu.Lock()
-		defer bc.mu.Unlock()
-		for _, msg := range bc.messages {
-			if msg.peerID == "alice" && msg.text == "hello bob" {
-				return true
-			}
-		}
-		return false
+		return bc.hasMessage("alice", "hello bob")
 	}) {
 		t.Fatal("bob never received alice's message")
 	}
@@ -138,14 +151,7 @@ func TestEndToEnd(t *testing.T) {
 	// 7. And the reverse direction.
 	bob.SendChat("alice", "hi alice")
 	if !waitFor(t, 10*time.Second, func() bool {
-		ac.mu.Lock()
-		defer ac.mu.Unlock()
-		for _, msg := range ac.messages {
-			if msg.peerID == "bob" && msg.text == "hi alice" {
-				return true
-			}
-		}
-		return false
+		return ac.hasMessage("bob", "hi alice")
 	}) {
 		t.Fatal("alice never received bob's message")
 	}

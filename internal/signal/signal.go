@@ -31,6 +31,12 @@ type RegisterRequest struct {
 	// hairpinning of the public address. This is a tiny slice of the idea ICE
 	// formalises as "host candidates".
 	LocalAddrs []string `json:"local_addrs,omitempty"`
+	// Incarnation is a random id the client generates ONCE at process start. It
+	// lets a peer that was already connected detect that this node RESTARTED
+	// (new process = new incarnation = new socket/port) versus merely refreshed,
+	// so it can drop the now-dead link and reconnect immediately instead of
+	// waiting out the QUIC idle timeout. See the client's reapStale.
+	Incarnation string `json:"incarnation,omitempty"`
 }
 
 // RegisterResponse echoes back the public address the lighthouse observed. This
@@ -43,9 +49,10 @@ type RegisterResponse struct {
 
 // Peer is one advertised node as seen by the lighthouse.
 type Peer struct {
-	NodeID     string   `json:"node_id"`
-	Addr       string   `json:"addr"`                  // public UDP ip:port observed by the lighthouse
-	LocalAddrs []string `json:"local_addrs,omitempty"` // LAN candidates the peer reported (see RegisterRequest)
+	NodeID      string   `json:"node_id"`
+	Addr        string   `json:"addr"`                  // public UDP ip:port observed by the lighthouse
+	LocalAddrs  []string `json:"local_addrs,omitempty"` // LAN candidates the peer reported (see RegisterRequest)
+	Incarnation string   `json:"incarnation,omitempty"` // changes when the peer restarts (see RegisterRequest)
 }
 
 // PeersResponse is the answer to GET /peers.

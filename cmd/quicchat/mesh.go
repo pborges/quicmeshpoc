@@ -28,7 +28,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -73,16 +75,18 @@ func (s connState) String() string {
 
 // peerConn holds an established chat connection to one peer.
 type peerConn struct {
-	nodeID  string
-	conn    *quic.Conn
-	stream  *quic.Stream // single bidirectional stream we read/write chat lines on
-	writeMu sync.Mutex   // serializes writes to stream (so concurrent sends don't interleave)
+	nodeID      string
+	incarnation string // the PEER's incarnation at connect time; if the roster later shows a different one, this link is to a dead process
+	conn        *quic.Conn
+	stream      *quic.Stream // single bidirectional stream we read/write chat lines on
+	writeMu     sync.Mutex   // serializes writes to stream (so concurrent sends don't interleave)
 }
 
 // Mesh owns the shared socket and all peer connections. Its goroutines push
 // updates to the TUI by calling the events callback (wired to program.Send).
 type Mesh struct {
 	nodeID      string
+	incarnation string // random id fixed for this process; lets peers detect when WE restart
 	lhURL       string // lighthouse base URL, e.g. https://127.0.0.1:4433
 	transport   *quic.Transport
 	listener    *quic.Listener
@@ -124,13 +128,14 @@ func NewMesh(nodeID, lighthouseURL string, insecure bool, logger *slog.Logger) (
 	tr := &quic.Transport{Conn: udpConn}
 
 	m := &Mesh{
-		nodeID:     nodeID,
-		lhURL:      lighthouseURL,
-		transport:  tr,
-		log:        logger,
-		conns:      make(map[string]*peerConn),
-		connecting: make(map[string]struct{}),
-		events:     func(any) {}, // no-op until main wires the real one
+		nodeID:      nodeID,
+		incarnation: newIncarnation(),
+		lhURL:       lighthouseURL,
+		transport:   tr,
+		log:         logger,
+		conns:       make(map[string]*peerConn),
+		connecting:  make(map[string]struct{}),
+		events:      func(any) {}, // no-op until main wires the real one
 	}
 
 	// 3. HTTP/3 client whose Dial hook reuses our shared transport. This is the
@@ -264,7 +269,7 @@ func (m *Mesh) registerLoop(ctx context.Context) {
 	defer t.Stop()
 	for {
 		var resp signal.RegisterResponse
-		err := m.post(ctx, "/register", signal.RegisterRequest{NodeID: m.nodeID, LocalAddrs: m.localCandidates()}, &resp)
+		err := m.post(ctx, "/register", signal.RegisterRequest{NodeID: m.nodeID, LocalAddrs: m.localCandidates(), Incarnation: m.incarnation}, &resp)
 		if err != nil {
 			m.statusf("register error: %v", err)
 		} else {
@@ -289,6 +294,7 @@ func (m *Mesh) peersLoop(ctx context.Context) {
 			m.log.Debug("peers poll failed", "err", err)
 		} else {
 			m.events(peersMsg{peers: resp.Peers})
+			m.reapStale(resp.Peers) // drop links to peers that have restarted
 			m.autoConnect(resp.Peers)
 		}
 		select {
@@ -319,6 +325,27 @@ func (m *Mesh) autoConnect(peers []signal.Peer) {
 	}
 }
 
+// reapStale drops any live connection whose peer's incarnation changed in the
+// roster — meaning that peer RESTARTED, so the link we're holding is to a dead
+// process. Closing it now lets us reconnect immediately instead of waiting out
+// the ~20s QUIC idle timeout. autoConnect (called right after) re-dials if we're
+// the initiator; otherwise we just wait for the restarted peer to dial us.
+func (m *Mesh) reapStale(peers []signal.Peer) {
+	for _, p := range peers {
+		m.mu.Lock()
+		pc, ok := m.conns[p.NodeID]
+		stale := ok && incarnationChanged(pc.incarnation, p.Incarnation)
+		m.mu.Unlock()
+		if !stale {
+			continue
+		}
+		m.statusf("%s restarted — dropping stale link", p.NodeID)
+		_ = pc.conn.CloseWithError(0, "peer restarted")
+		m.removeConn(p.NodeID)
+		m.setState(p.NodeID, stateDisconnected)
+	}
+}
+
 // signalsStreamLoop holds open an SSE stream to the lighthouse and reacts to
 // punch requests aimed at us the instant they're pushed. When another node asks
 // the lighthouse to reach us, a Signal arrives here and we play the RESPONDER
@@ -326,18 +353,44 @@ func (m *Mesh) autoConnect(peers []signal.Peer) {
 // pick up the QUIC connection they dial.
 //
 // The stream can drop (lighthouse restart, idle timeout, transient loss), so
-// this loops: (re)connect, consume until it ends, brief backoff, repeat — until
-// our context is cancelled on shutdown.
+// this loops: (re)connect, consume until it ends, repeat — until our context is
+// cancelled on shutdown.
+//
+// Reconnect timing matters: while the stream is down we're deaf to punch
+// requests, which directly slows RE-connects. So a stream that stayed up a
+// while then dropped (a transient blip) is reconnected IMMEDIATELY; only a
+// stream that fails fast and repeatedly (the lighthouse is actually down) backs
+// off — exponentially, capped — so we don't hammer it. The first attempt and
+// every post-blip attempt are immediate, which keeps connects snappy.
 func (m *Mesh) signalsStreamLoop(ctx context.Context) {
 	defer logutil.Recover(m.log, "signalsStreamLoop")
+	const maxBackoff = 5 * time.Second
+	var backoff time.Duration // 0 = reconnect immediately
 	for {
-		if err := m.streamSignals(ctx); err != nil && ctx.Err() == nil {
+		if backoff > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+		}
+
+		start := time.Now()
+		err := m.streamSignals(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
 			m.log.Debug("signals stream ended; reconnecting", "err", err)
 		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second): // backoff before reconnecting
+
+		switch {
+		case time.Since(start) >= maxBackoff:
+			backoff = 0 // it was healthy for a while; treat the drop as transient
+		case backoff == 0:
+			backoff = 250 * time.Millisecond
+		default:
+			backoff = min(backoff*2, maxBackoff)
 		}
 	}
 }
@@ -561,8 +614,11 @@ func (m *Mesh) Connect(peer signal.Peer) {
 			m.setState(peer.NodeID, stateFailed)
 			return
 		}
-		pc := &peerConn{nodeID: peer.NodeID, conn: conn, stream: stream}
-		if err := m.sendLine(pc, "HELLO "+m.nodeID); err != nil {
+		// Record the peer's incarnation from the roster entry we dialed, so we can
+		// later notice if it restarts. Send OUR incarnation in the HELLO so the
+		// responder can do the same for us.
+		pc := &peerConn{nodeID: peer.NodeID, incarnation: peer.Incarnation, conn: conn, stream: stream}
+		if err := m.sendLine(pc, "HELLO "+m.nodeID+" "+m.incarnation); err != nil {
 			m.log.Error("hello write failed", "peer", peer.NodeID, "err", err)
 			m.setState(peer.NodeID, stateFailed)
 			return
@@ -647,7 +703,8 @@ func (m *Mesh) dialFirst(ctx context.Context, cands []string) (*quic.Conn, error
 }
 
 // acceptLoop accepts inbound peer connections (RESPONDER side handshake). The
-// initiator sends "HELLO <nodeID>" as the first line so we can identify them.
+// initiator sends "HELLO <nodeID> <incarnation>" as the first line so we can
+// identify them (and notice if they later restart).
 func (m *Mesh) acceptLoop(ctx context.Context) {
 	defer logutil.Recover(m.log, "acceptLoop")
 	for {
@@ -671,19 +728,26 @@ func (m *Mesh) handleInbound(ctx context.Context, conn *quic.Conn) {
 	}
 	reader := bufio.NewReader(stream)
 
-	// First line identifies the peer: "HELLO <nodeID>".
+	// First line identifies the peer: "HELLO <nodeID> <incarnation>". The
+	// incarnation is optional (older peers omit it), so parse by fields rather
+	// than failing without it.
 	hello, err := reader.ReadString('\n')
 	if err != nil {
 		m.log.Debug("read HELLO failed", "remote", conn.RemoteAddr().String(), "err", err)
 		return
 	}
-	var peerID string
-	if _, err := fmt.Sscanf(hello, "HELLO %s", &peerID); err != nil || peerID == "" {
+	fields := strings.Fields(hello)
+	if len(fields) < 2 || fields[0] != "HELLO" {
 		m.log.Warn("malformed HELLO", "remote", conn.RemoteAddr().String(), "line", trimNewline(hello))
 		return
 	}
+	peerID := fields[1]
+	peerIncarnation := ""
+	if len(fields) >= 3 {
+		peerIncarnation = fields[2]
+	}
 
-	m.addConn(&peerConn{nodeID: peerID, conn: conn, stream: stream})
+	m.addConn(&peerConn{nodeID: peerID, incarnation: peerIncarnation, conn: conn, stream: stream})
 	m.setState(peerID, stateConnected)
 	m.statusf("accepted connection from %s (%s)", peerID, conn.RemoteAddr())
 
@@ -809,6 +873,27 @@ func (m *Mesh) removeConn(peerID string) {
 func (m *Mesh) setState(peerID string, st connState) {
 	m.log.Debug("peer state", "peer", peerID, "state", st.String())
 	m.events(stateMsg{peerID: peerID, state: st})
+}
+
+// incarnationChanged reports whether a peer we hold a link to has restarted:
+// it's true only when BOTH the incarnation we recorded and the one now in the
+// roster are present and differ. If either side is empty (a peer or lighthouse
+// predating incarnations), we conservatively say "not changed" so we never reap
+// a healthy link in a mixed-version fleet.
+func incarnationChanged(have, latest string) bool {
+	return have != "" && latest != "" && have != latest
+}
+
+// newIncarnation returns a random id used to mark this process. Peers compare it
+// across roster refreshes to tell "this node restarted" (new id) apart from
+// "this node is just refreshing" (same id). Random, so it can't collide with a
+// previous run the way a reset wall-clock could.
+func newIncarnation() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 16) // good enough fallback
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func trimNewline(s string) string {
